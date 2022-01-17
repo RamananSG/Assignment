@@ -1,0 +1,157 @@
+# importing the required libs
+import requests, sys, os
+from urllib.parse import quote_plus
+import pandas as pd
+import numpy as np
+import time, pdb
+import talib
+from datetime import datetime
+import threading, time
+from functools import partial 
+
+os.chdir("E:\Stockfeast\Analysis\pt_bot") # setup working directory
+#indices = "NIFTY 50"
+def autoTrading(indices, stock_number):
+    url = 'https://www.nseindia.com/api/equity-stockIndices?index=' + quote_plus(indices)
+    def get_data():
+        try:
+            s = requests.Session()
+            headers = {'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.66 Safari/537.36'}
+            s.headers.update(headers)
+            # You have to first retrieve the initial page:
+            resp = s.get('https://www.nseindia.com/market-data/live-equity-market')
+            resp.raise_for_status()
+            #print(resp.text)
+            resp = s.get(url)
+            resp.raise_for_status()
+            j_data = resp.json()
+            df = pd.DataFrame(j_data['data'][1:])
+            df = df[['symbol', 'open', 'dayHigh', 'dayLow', 'lastPrice', 'previousClose', 'change', 'pChange', 'totalTradedVolume', 'totalTradedValue', 'lastUpdateTime']]
+            return df, j_data['metadata']['percChange']
+        except Exception as e:
+            print(e)
+            return False
+    
+    #tataurl = 'https://www.nseindia.com/api/historical/cm/equity?symbol=TATACONSUM&series=["EQ"]&from=14-01-2021&to=14-01-2022'
+    indice_data = get_data()# collecting indices stock list with ohlc and indices mode
+    if indice_data:
+        df = indice_data[0]
+        print(time.ctime())
+    
+        if indice_data[1] >= 0:
+            print("Bullish market")
+            trend = 1
+            select_SL = 'dayLow'
+            df = df.sort_values('pChange', ascending=False).reset_index(drop=True)
+            topGainers = df.head(2)
+            selected_stock = topGainers[stock_number-1:stock_number].reset_index(drop=True)
+        elif indice_data[1] <= 0:
+            print("Bearish market")
+            trend = -1
+            select_SL = 'dayHigh'
+            df = df.sort_values('pChange').reset_index(drop=True)
+            topLosers = df.head(2)
+            selected_stock = topLosers[stock_number-1:stock_number].reset_index(drop=True)
+        else:
+            print("Flat market no trade "+ indices)
+            trend = 0
+        
+        if trend:
+            # Selecting OHLC
+            op,hi,lo,cl,pc = selected_stock['open'], selected_stock['dayHigh'], selected_stock['dayLow'], selected_stock['lastPrice'], selected_stock['pChange']
+            symbol = selected_stock['symbol'][0]
+            
+            def checkBullBearCandle(O,H,L,C):
+                topWickDiff = (H - C)/C*100
+                botWickDiff = (O - L)/O*100
+                output = 1 if C > O and topWickDiff <= .15 else 1 if C < O and botWickDiff < .15 else 0
+                return output
+            
+            candle = 0
+            if trend == 1:
+                hammer = talib.CDLHAMMER(op,hi,lo,cl).reset_index(drop=True)[0]
+                bullish_marubozu = 1 if (op[0] == lo[0] and cl[0] == hi[0]) and (pc[0] >= 1 and pc[0] <= 3) else 0
+                Normal_bullish = 1 if (checkBullBearCandle(op[0],hi[0],lo[0],cl[0])) and (pc[0] >= 1 and pc[0] <= 3) else 0
+                if hammer or bullish_marubozu or Normal_bullish:
+                    validated_candle_lastPrice = cl[0]
+                    candle = 1
+                    print(trend, symbol, "Candle is validated")
+            if trend == -1:
+                shootingStar = talib.CDLSHOOTINGSTAR(op,hi,lo,cl).reset_index(drop=True)[0]
+                bearish_marubozu = 1 if (op[0] == hi[0] and cl[0] == lo[0]) and (pc[0] <= -1 and pc[0] >= -3) else 0
+                Normal_bearish = 1 if (checkBullBearCandle(op[0],hi[0],lo[0],cl[0])) and (pc[0] <= -1 and pc[0] >= -3) else 0
+                if shootingStar or bearish_marubozu or Normal_bearish:
+                    validated_candle_lastPrice = -cl[0]
+                    candle = -1
+                    print(trend, symbol, "Candle is validated")
+            
+            if not candle:
+                print(symbol, "candle is not validated")
+            if candle:
+                # stock monitoring
+                stop_loss = 0
+                stock_lst = []
+                stock_lst.append(selected_stock)
+                
+                logfile = symbol+"_"+str(datetime.now().date())+".txt"
+                with open(logfile, 'w') as f:
+                     f.write(symbol)
+                     
+                while datetime.now().hour < 10:
+                    time.sleep(59)
+                    with open(logfile, 'a') as f:
+                         f.write("\n"+symbol +" "+str(time.ctime()))
+                    print(time.ctime())
+                    if get_data():
+                        stock = get_data()[0] 
+                        stock = stock[stock['symbol'] == symbol].reset_index(drop=True)
+                        trade_lastprice = candle * stock['lastPrice'][0] # to get positive or negative number depends of market trend
+                        print(trade_lastprice, validated_candle_lastPrice)
+                        if trade_lastprice >= validated_candle_lastPrice:
+                            stop_loss = candle * selected_stock[select_SL][0]
+                            print("Enter Trade")
+                            print(symbol, "enter price :", trade_lastprice, "stop loss:", stop_loss)
+                            with open(logfile, 'a') as f:
+                                f.write("\n"+str(time.ctime())+", "+symbol+", enter price : " + str(trade_lastprice) + ", stop loss : " + str(stop_loss)+"\n\n")
+                            break
+                
+                while stop_loss:
+                    time.sleep(59)
+                    print(time.ctime())
+                    if get_data():
+                        stock = get_data()[0]
+                        stock = stock[stock['symbol'] == symbol].reset_index(drop=True)
+                        stock['stop_loss'] = stop_loss
+                        stock['stop_hit'] = "No"
+                        stock_lst.append(stock)
+                        stock_lastprice = candle * stock['lastPrice'][0]  # to get
+                        positive or negative number depends of market trend
+                        with open(logfile, 'a') as f:
+                             f.write("\n"+str(time.ctime())+", "+symbol +", stop hit : No, ltp:" + str(stock_lastprice))
+                        if stop_loss >= stock_lastprice:
+                            stock['stop_hit'] = "Yes"
+                            stock_lst.append(stock)
+                            df_stock = pd.concat(stock_lst)
+                            df_stock.to_excel(symbol+'.xlsx', index=False)
+                            with open(logfile, 'a') as f:
+                                 f.write("\n"+str(time.ctime())+", "+symbol +", stop hit : Yes, ltp:" + str(stock_lastprice))
+                            break
+                        if datetime.now().hour >= 10:
+                            df_stock = pd.concat(stock_lst)
+                            df_stock.to_excel(symbol+'.xlsx', index=False)
+                            break
+                
+# to trade on first gainer or loser
+nifty50_1 = threading.Thread(target=partial (autoTrading, 'NIFTY 50', 1))
+niftynext50_1 = threading.Thread(target=partial (autoTrading,'NIFTY NEXT 50', 1))
+midcap100_1 = threading.Thread(target=partial (autoTrading,'NIFTY MIDCAP 100', 1))
+# to trade on second gainer or loser
+nifty50_2 = threading.Thread(target=partial (autoTrading, 'NIFTY 50', 2))
+niftynext50_2 = threading.Thread(target=partial (autoTrading,'NIFTY NEXT 50', 2))
+midcap100_2 = threading.Thread(target=partial (autoTrading,'NIFTY MIDCAP 100', 2))
+
+nifty50_1.start();
+niftynext50_1.start();
+midcap100_1.start()
+nifty50_2.start()
+niftynext50_2.start();midcap100_2.start()
